@@ -87,6 +87,12 @@
       "title": "Minimum characters to condense",
       "description": "Smallest kept episode (tool input and output characters) handed to the condenser.",
       "default": 4000
+    },
+    "maxConcurrentCondense": {
+      "type": "number",
+      "title": "Maximum concurrent condenser calls",
+      "description": "Condenser calls in flight at once; vLLM batches them, so 12 keeps a compaction near 25 s on cave2. 0 for no limit.",
+      "default": 4
     }
   }
 }

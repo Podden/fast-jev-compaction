@@ -77,6 +77,14 @@ describe('hook config', () => {
   });
 });
 
+describe('condenser config', () => {
+  it('passes the condenser options through', () => {
+    expect(
+      resolveHookConfig({ condenseUrl: 'http://llm.local/v1/chat/completions', condenseMinChars: 12000, maxConcurrentCondense: 12 }),
+    ).toMatchObject({ condenseUrl: 'http://llm.local/v1/chat/completions', condenseMinChars: 12000, maxConcurrentCondense: 12 });
+  });
+});
+
 describe('session message mapping', () => {
   it('returns the engine objects for untouched messages and handle-less copies for rebuilt ones', () => {
     const messages = transcript();

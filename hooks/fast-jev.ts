@@ -76,6 +76,7 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     'truncateHeadChars',
     'maxConcurrentRequests',
     'condenseMinChars',
+    'maxConcurrentCondense',
   ] as const) {
     const value = options[key];
     if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;

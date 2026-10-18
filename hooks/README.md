@@ -59,6 +59,7 @@ The plugin declares these `userConfig` values in
 | `condenseUrl` | empty (off) |
 | `condenseModel` | `qwen3.8:27b` |
 | `condenseMinChars` | `4000` |
+| `maxConcurrentCondense` | `4` |
 
 The TypeSafe key can be supplied as the sensitive `apiKey` plugin option or
 through `TYPESAFE_API_KEY`. The environment variable is the recommended
