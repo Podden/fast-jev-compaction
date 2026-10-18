@@ -48,11 +48,15 @@ const messages: Message[] = [
   user('Great. Next, add a changelog entry for this fix.'),
 ];
 
-const result = await compactMessages(messages, { preserveRecentMessages: 2 });
+// SYSTEM_ONE_BASE_URL points the demo at a self-hosted endpoint, e.g. decider on cave2.
+const result = await compactMessages(messages, {
+  preserveRecentMessages: 2,
+  baseUrl: process.env.SYSTEM_ONE_BASE_URL,
+});
 
-console.log('id | tool | action | keep call | keep result');
+console.log('episode | calls | chars | action | keep');
 for (const d of result.decisions) {
-  console.log(`${d.id} | ${d.tool} | ${d.action} (${d.reason}) | ${d.keepCall.toFixed(2)} | ${d.keepResult.toFixed(2)}`);
+  console.log(`${d.id} | ${d.calls} | ${d.chars} | ${d.action} | ${d.keep.toFixed(2)}`);
 }
 console.log('');
 console.log('stats:', JSON.stringify(result.stats));

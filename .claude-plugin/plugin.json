@@ -1,7 +1,7 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.3.0",
-  "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
+  "version": "0.6.0",
+  "description": "Verbatim Jev-guided compaction for Claude Code sessions: search runs whose outcome is already written down shrink to one line per call.",
   "license": "MIT",
   "userConfig": {
     "apiKey": {
@@ -13,7 +13,7 @@
     "keepThreshold": {
       "type": "number",
       "title": "Keep threshold",
-      "description": "Minimum Jev probability that a tool call or tool result is still needed; below it the item is removed.",
+      "description": "Minimum keep probability for a search run to stay call by call: 1 minus Jev's probability that the text after it reports what its calls showed.",
       "default": 0.5
     },
     "preserveRecentMessages": {
@@ -37,26 +37,56 @@
     "maxStateTokens": {
       "type": "number",
       "title": "Maximum Jev state tokens",
-      "description": "Estimated token budget for the conversation state sent with every Jev request.",
+      "description": "Estimated token budget for the state of one Jev request (one search run).",
       "default": 25000
     },
     "maxRequestTokens": {
       "type": "number",
       "title": "Maximum Jev request tokens",
-      "description": "Estimated token budget for state plus questions in one Jev request.",
+      "description": "Estimated token budget for state plus question in one Jev request.",
       "default": 30000
     },
     "truncateHeadChars": {
       "type": "number",
-      "title": "Truncated tool result head",
-      "description": "Characters of a tool result kept when Jev decides its full output is no longer needed; 0 keeps only the note.",
+      "title": "Error head in the replacement note",
+      "description": "Characters of a failed call's output kept in the note that replaces a search run; 0 keeps only 'error'.",
       "default": 300
+    },
+    "baseUrl": {
+      "type": "string",
+      "title": "System One endpoint",
+      "description": "Endpoint of another System One model, e.g. http://192.168.107.103:5810/v1/systemone for the self-hosted decider. Leave unset for TypeSafe Jev; a custom endpoint needs no API key.",
+      "default": ""
+    },
+    "maxConcurrentRequests": {
+      "type": "number",
+      "title": "Maximum concurrent requests",
+      "description": "Requests in flight at once; 1 for the single-GPU decider, whose queue would otherwise push later requests past the host's 30 s fetch limit. 0 for no limit.",
+      "default": 0
     },
     "model": {
       "type": "string",
       "title": "Jev model",
       "description": "TypeSafe Jev model name.",
       "default": "jev-latest"
+    },
+    "condenseUrl": {
+      "type": "string",
+      "title": "Condenser endpoint",
+      "description": "OpenAI-compatible chat completions URL (e.g. http://192.168.107.103:11500/v1/chat/completions). When set, episodes the decider keeps are replaced by a fact note from this model, and their full outputs are saved under .claude/fast-jev/. Empty: kept episodes stay verbatim.",
+      "default": ""
+    },
+    "condenseModel": {
+      "type": "string",
+      "title": "Condenser model",
+      "description": "Model name for the condenser endpoint.",
+      "default": "qwen3.8:27b"
+    },
+    "condenseMinChars": {
+      "type": "number",
+      "title": "Minimum characters to condense",
+      "description": "Smallest kept episode (tool input and output characters) handed to the condenser.",
+      "default": 4000
     }
   }
 }

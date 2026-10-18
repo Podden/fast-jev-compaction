@@ -41,70 +41,114 @@ export interface ToolCall {
   callIndex: number;
   /** Index of the message holding the tool_result block. */
   resultIndex: number;
+  /** The tool_result text. */
+  result: string;
   resultChars: number;
   isError: boolean;
   /** In the first or the newest preserved messages; never a candidate. */
   pinned: boolean;
 }
 
-export interface CallAnswer {
-  /** Jev's probability that the call itself still matters. */
-  keepCall: number;
-  /** Jev's probability that the full result still needs to stay verbatim. */
-  keepResult: number;
-}
-
-export type CallAction = 'keep' | 'drop_result' | 'drop_call';
-
-export interface CallDecision extends CallAnswer {
+/**
+ * A search run: the tool calls the assistant made between two texts, e.g.
+ * greps, reads and commands that led to a finding stated in the text after.
+ */
+export interface Episode {
+  /** Short id used in the Jev state and question names (`e1`, `e2`, ...). */
   id: string;
-  tool: string;
-  action: CallAction;
-  reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped';
+  /** Index of the message holding the episode's first tool call. */
+  start: number;
+  /** Index of the message whose text closes the episode (`after`). */
+  end: number;
+  calls: ToolCall[];
+  /** Characters of tool input and output the episode holds. */
+  chars: number;
 }
 
-export interface HistoryToolCall {
+/** One episode as Jev sees it. */
+export interface EpisodeEntry {
   id: string;
-  tool: string;
-  input: string;
-  result: string;
+  /** The text the episode started with, if its first message had one. */
+  before?: string;
+  /** One line per call: tool, input, outcome, and the head of the output. */
+  calls: string[];
+  /** The text that closes the episode; where the finding should be stated. */
+  after: string;
 }
 
-export interface HistoryEntry {
-  i: number;
-  role: Role;
-  text: string;
-  /** Structured per call, or one compact line per call once the state has to shrink. */
-  tool_calls?: HistoryToolCall[] | string[];
-}
-
-/** The state sent with every Jev request: the whole history, results omitted. */
-export interface CompactionState {
+/** The state of one Jev request: the episodes asked about in it. */
+export interface EpisodeState {
   context: string;
   goal: string;
-  history: HistoryEntry[];
+  episodes: EpisodeEntry[];
 }
 
-export interface FittedState {
-  state: CompactionState;
-  tokens: number;
-  /** Which fitting stage produced the state, for diagnostics. */
-  stage: string;
+export interface EpisodeDecision {
+  id: string;
+  calls: number;
+  chars: number;
+  /** 1 − Jev's probability that the text after the episode reports its outcome. */
+  keep: number;
+  /** `condense`: kept by Jev, then replaced by the condenser's fact note. */
+  action: 'keep' | 'replace' | 'condense';
+}
+
+/** One call of an episode handed to a condenser, with its full output. */
+export interface CondenseCall {
+  tool: string;
+  input: Record<string, unknown>;
+  isError: boolean;
+  output: string;
+}
+
+/** What a condenser gets: an episode whose outcome the text after does not report. */
+export interface CondenseInput {
+  goal: string;
+  before?: string;
+  after: string;
+  calls: CondenseCall[];
+}
+
+/**
+ * Writes the facts of an episode as a short note (e.g. a fast LLM). A
+ * rejection keeps the episode as it is.
+ */
+export interface EpisodeCondenser {
+  condense(input: CondenseInput): Promise<string>;
 }
 
 export interface CompactOptions {
   /** Ongoing task description; defaults to the last few user prompts. */
   goal?: string;
-  /** Minimum keep probability for a call or result to stay. Default 0.5. */
+  /** Minimum keep probability for an episode to stay call by call. Default 0.5. */
   keepThreshold?: number;
   /** Newest messages never touched (the first message is always kept). Default 6. */
   preserveRecentMessages?: number;
-  /** Estimated token ceiling for the state. Default 25000. */
+  /** Estimated token ceiling for the state of one request (one episode). Default 25000. */
   maxStateTokens?: number;
-  /** Estimated token ceiling for state plus one batch of questions. Default 30000. */
+  /** Estimated token ceiling for state plus question of one request. Default 30000. */
   maxRequestTokens?: number;
-  /** Characters of a dropped tool result to retain. Default 300. */
+  /** Characters of a failed call's output kept in the replacement note. Default 300. */
   truncateHeadChars?: number;
+  /** Requests in flight at once; 1 for a single-GPU server like decider. 0 for no limit. Default 0. */
+  maxConcurrentRequests?: number;
+  /** Condenses episodes Jev keeps into a fact note; unset leaves them verbatim. */
+  condenser?: EpisodeCondenser;
+  /** Smallest kept episode (tool input and output chars) worth condensing. Default 4000. */
+  condenseMinChars?: number;
+  /** Condenser calls in flight at once; 0 for no limit. Default 4. */
+  maxConcurrentCondense?: number;
+  /**
+   * Smallest share of a note's identifiers (paths, ids, numbers) that must
+   * occur in the episode; a note below keeps the episode. Default 0.3.
+   */
+  condenseMinGrounded?: number;
+  /**
+   * Stores a condensed episode's full calls and outputs and resolves where
+   * (a file path), so the note can point there. Optional; a rejection drops
+   * the pointer, not the note.
+   */
+  archive?: (episode: Episode, text: string) => Promise<string>;
 }
 
 export interface ResolvedCompactOptions {
@@ -114,25 +158,37 @@ export interface ResolvedCompactOptions {
   maxStateTokens: number;
   maxRequestTokens: number;
   truncateHeadChars: number;
+  maxConcurrentRequests: number;
+  condenseMinChars: number;
+  maxConcurrentCondense: number;
+  condenseMinGrounded: number;
 }
 
 export interface CompactResult {
   /** The compacted transcript; untouched messages are the input objects. */
   messages: Message[];
-  decisions: CallDecision[];
+  /** One per episode Jev was asked about. */
+  decisions: EpisodeDecision[];
   stats: {
     messagesBefore: number;
     messagesAfter: number;
     charsBefore: number;
     charsAfter: number;
-    calls: number;
+    /** Closed episodes outside the pinned messages, asked about or not. */
+    episodes: number;
+    replaced: number;
     kept: number;
-    resultsDropped: number;
-    callsDropped: number;
-    pinned: number;
+    /** Kept episodes replaced by a condenser note (counted in `kept` too). */
+    condensed: number;
+    /** Condenser calls that failed; their episodes stayed verbatim. */
+    condenseFailed: number;
+    /** Wall time of the condenser stage. */
+    condenseMs: number;
+    /** Episodes left alone without asking: too small, or too big for one request. */
+    skipped: number;
+    callsRemoved: number;
+    /** Largest state of any request. */
     stateTokens: number;
-    /** Which fitting stage the state needed, '' when no request was made. */
-    stateStage: string;
     requests: number;
     ms: number;
   };

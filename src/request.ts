@@ -13,7 +13,8 @@ export interface JevRequest {
 /** The HTTP request for one Jev call, for any fetch-like transport. */
 export function buildJevRequest(
   params: {
-    apiKey: string;
+    /** Omitted from the request when empty (self-hosted endpoints without auth). */
+    apiKey?: string;
     model?: string;
     baseUrl?: string;
   },
@@ -24,7 +25,7 @@ export function buildJevRequest(
     url: params.baseUrl ?? SYSTEM_ONE_URL,
     method: 'POST',
     headers: {
-      authorization: `Bearer ${params.apiKey}`,
+      ...(params.apiKey ? { authorization: `Bearer ${params.apiKey}` } : {}),
       'content-type': 'application/json',
     },
     body: JSON.stringify({

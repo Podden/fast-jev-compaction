@@ -9,10 +9,12 @@ import type {
 } from 'claude-code';
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
+import { buildCondenseRequest, parseCondenseResponse } from '../src/condense.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
 import type {
   CompactOptions,
   CompactResult,
+  EpisodeCondenser,
   JevAsker,
   Message,
   ToolResult,
@@ -23,6 +25,7 @@ const HOOK_DEFAULTS = {
   compactAtPercent: 60,
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
+  condenseModel: 'qwen3.8:27b',
 };
 
 export type HookFetchInit = {
@@ -42,9 +45,14 @@ export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetch
 
 export type HookConfig = CompactOptions & {
   apiKey?: string;
+  /** A System One endpoint other than TypeSafe's, e.g. a self-hosted decider; needs no key. */
+  baseUrl?: string;
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
+  /** OpenAI-compatible chat completions URL; set, kept episodes get a fact note. */
+  condenseUrl?: string;
+  condenseModel: string;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -66,6 +74,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     'maxStateTokens',
     'maxRequestTokens',
     'truncateHeadChars',
+    'maxConcurrentRequests',
+    'condenseMinChars',
   ] as const) {
     const value = options[key];
     if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;
@@ -79,19 +89,29 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       HOOK_DEFAULTS.minReductionRatio,
     ),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
+    condenseModel: optionString(options, 'condenseModel') ?? HOOK_DEFAULTS.condenseModel,
   };
+  const condenseUrl = optionString(options, 'condenseUrl');
+  if (condenseUrl) config.condenseUrl = condenseUrl;
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
+  const baseUrl = optionString(options, 'baseUrl');
+  if (baseUrl) config.baseUrl = baseUrl;
   const goal = optionString(options, 'goal');
   if (goal) config.goal = goal;
   return config;
 }
 
 /** A `JevAsker` over the engine's `$.http.fetch`. */
-export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string): JevAsker {
+export function jevAsker(
+  fetchFn: HookFetch,
+  apiKey: string | undefined,
+  model: string,
+  baseUrl?: string,
+): JevAsker {
   return {
     async ask(state, questions) {
-      const request = buildJevRequest({ apiKey, model }, state, questions);
+      const request = buildJevRequest({ apiKey, model, baseUrl }, state, questions);
       const response = await fetchFn(request.url, {
         method: request.method,
         headers: request.headers,
@@ -156,19 +176,52 @@ export function toSessionMessages(
   });
 }
 
+/** An `EpisodeCondenser` over the engine's `$.http.fetch`. */
+export function llmCondenser(fetchFn: HookFetch, url: string, model: string): EpisodeCondenser {
+  return {
+    async condense(input) {
+      const request = buildCondenseRequest({ url, model }, input);
+      const response = await fetchFn(request.url, request);
+      return parseCondenseResponse(response.status, response.ok, response.text);
+    },
+  };
+}
+
+/**
+ * Drops the engine's `handle` so each kept message is written as a fresh
+ * record after the compact boundary. With handles, kept records keep their
+ * parentUuid and message.id from before the boundary, and `--resume` walks
+ * back into the full history or repeats them (#89, #129, #145;
+ * anthropics/claude-code#95328). The engine's hidden bookkeeping for those
+ * messages (reasoning, images) is lost; their text and tool pairs stay.
+ */
+export function withoutHandles(messages: readonly SessionMessage[]): SessionMessage[] {
+  return messages.map(({ handle: _handle, ...rest }) => rest);
+}
+
 export type SessionCompaction = {
   result: CompactResult;
   messages: SessionMessage[];
 };
 
-/** Runs the library over a session transcript; throws when the key is missing or Jev fails. */
+/** Runs the library over a session transcript; throws when TypeSafe's key is missing or Jev fails. */
 export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
   fetchFn: HookFetch,
+  archive?: CompactOptions['archive'],
 ): Promise<SessionCompaction> {
-  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  if (!config.apiKey && !config.baseUrl) throw new Error('TYPESAFE_API_KEY is not configured');
+  const result = await compact(
+    messages,
+    jevAsker(fetchFn, config.apiKey, config.model, config.baseUrl),
+    {
+      ...config,
+      ...(config.condenseUrl
+        ? { condenser: llmCondenser(fetchFn, config.condenseUrl, config.condenseModel), archive }
+        : {}),
+    },
+  );
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -179,25 +232,21 @@ function percent(ratio: number): string {
 export function summarize(result: CompactResult): string {
   const { stats } = result;
   const parts = [
-    stats.kept > 0 ? `${stats.kept} kept` : '',
-    stats.resultsDropped > 0 ? `${stats.resultsDropped} results truncated` : '',
-    stats.callsDropped > 0 ? `${stats.callsDropped} call_dropped` : '',
-    stats.pinned > 0 ? `${stats.pinned} pinned` : '',
+    `${stats.replaced} of ${stats.replaced + stats.kept} episodes replaced (${stats.callsRemoved} calls)`,
+    stats.condensed > 0 ? `${stats.condensed} condensed in ${(stats.condenseMs / 1000).toFixed(1)} s` : '',
+    stats.condenseFailed > 0 ? `${stats.condenseFailed} condense failed` : '',
+    stats.skipped > 0 ? `${stats.skipped} too small` : '',
   ].filter(Boolean);
-  return `${percent(reductionRatio(result))} reduction; ${
-    parts.join(', ') || 'no tool calls'
-  }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)`;
+  return `${percent(reductionRatio(result))} reduction; ${parts.join(', ')}; state up to ~${
+    stats.stateTokens
+  } tokens in ${stats.requests} request(s)`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
 
 export function decisionLog(result: CompactResult): string {
   return result.decisions
-    .filter((d) => d.reason !== 'pinned')
-    .map(
-      (d) =>
-        `${d.id}:${d.tool}:${d.action}/call=${d.keepCall.toFixed(2)}/result=${d.keepResult.toFixed(2)}`,
-    )
+    .map((d) => `${d.id}:${d.calls}calls/${d.chars}ch:${d.action}/keep=${d.keep.toFixed(2)}`)
     .join(' ');
 }
 
@@ -261,12 +310,30 @@ export const register: Register = (on: On, options: PluginOptions) => {
   let compacting = false;
 
   on('session.compact', async ($, event, next) => {
+    // Subagent and fork transcripts are short-lived; leave them to the engine.
+    if (event.agentId) return next(event);
+    // A speculative compaction would cost a full Jev run per turn (#107).
+    if (event.trigger === 'precompute') {
+      return { skip: 'fast-jev-compaction does not precompute' };
+    }
     try {
       const config = { ...configured, apiKey: await getApiKey($, configured) };
-      const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
-        const response = await $.http.fetch(url, init);
-        return { status: response.status, ok: response.ok, text: response.text };
-      });
+      const folder = `.claude/fast-jev/${new Date().toISOString().replace(/[:.]/g, '-')}`;
+      const { result, messages } = await compactSession(
+        event.messages,
+        config,
+        async (url, init) => {
+          const response = await $.http.fetch(url, init);
+          return { status: response.status, ok: response.ok, text: response.text };
+        },
+        async (episode, text) => {
+          // Full tool outputs stay on this machine; keep them out of git.
+          await $.fs.write('.claude/fast-jev/.gitignore', '*\n');
+          const path = `${folder}/${episode.id}.txt`;
+          await $.fs.write(path, text);
+          return path;
+        },
+      );
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
         notify(
@@ -279,7 +346,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         $,
         `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
       );
-      return { messages };
+      return { messages: withoutHandles(messages) };
     } catch (error) {
       notify(
         $,
@@ -290,17 +357,29 @@ export const register: Register = (on: On, options: PluginOptions) => {
   });
 
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
-    if (compacting) return next(event);
+    if (event.agentId || event.reason !== 'answer' || compacting) return next(event);
+    // Set before the first await, so a second turn.complete cannot slip past (#107).
+    compacting = true;
+    const skipped = (error: unknown) =>
+      $.ui.log(`auto-compact skipped (${error instanceof Error ? error.message : String(error)})`);
     try {
       const { context } = await $.session.usage();
-      if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
-      compacting = true;
-      await $.session.compact();
+      if ((context.percent ?? 0) < configured.compactAtPercent) {
+        compacting = false;
+        return next(event);
+      }
+      // Inside this dispatch the turn still counts as in flight and compact()
+      // is rejected; run it once the dispatch has resolved (#149).
+      $.clock.after(0, () => {
+        $.session
+          .compact()
+          .catch(skipped)
+          .finally(() => {
+            compacting = false;
+          });
+      });
     } catch (error) {
-      $.ui.log(
-        `auto-compact skipped (${error instanceof Error ? error.message : String(error)})`,
-      );
-    } finally {
+      skipped(error);
       compacting = false;
     }
     return next(event);

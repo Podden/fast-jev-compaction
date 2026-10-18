@@ -1,18 +1,21 @@
 # fast-jev-compaction
 
 Claude Code plugin that replaces the compaction summary with Jev decisions:
-every tool call and result is scored in one fast request, stale ones are
-dropped or truncated, everything kept stays verbatim. Also usable as an npm
+every search run (the tool calls between two assistant texts) is checked in one
+fast request, and a run whose outcome the next text already reports shrinks to
+one line per call. Everything else stays verbatim. Also usable as an npm
 library.
 
 ## What and why
 
 Most context compaction asks an LLM to summarize old turns. A summary is
 lossy: a file path, exact error, constraint, or command can disappear even when
-it matters later. This library never rewrites anything. It only deletes tool
-calls and tool results Jev says are no longer needed, and it asks Jev while
-showing it the whole conversation. User and assistant text stays verbatim and
-in order.
+it matters later. This library never rewrites text. Most of a coding session is
+the path to a finding: greps, reads and commands whose outputs the assistant
+has already condensed into a sentence such as "the 13 rules are hidden because
+plugin X is missing". Once that sentence exists, the path can go. User and
+assistant text stays verbatim and in order, and failed calls stay listed with
+the head of their error, so the pitfalls on the way are not repeated.
 
 The repository is both an npm package (`src/`) and a Claude Code plugin
 (`hooks/`, `.claude-plugin/`) that uses the package to replace Claude Code's
@@ -20,41 +23,37 @@ built-in compaction summary with the original messages.
 
 ## How it works
 
-1. Every `tool_use` is paired with its `tool_result` by `tool_use_id`. Calls in
-   the first message or in the newest `preserveRecentMessages` messages are
-   pinned and never touched.
-2. The **state** sent to Jev is the whole conversation so far, oldest first,
-   with every tool result replaced by a short note (`ok, 4213 chars (omitted)`).
-   Tool inputs are included, texts are included, nothing is summarized.
-3. The state is fitted into `maxStateTokens` (25k by default) in stages, each
-   applied only if the previous one was not enough: tool inputs truncated to
-   1000, then 200, then 60 characters; long texts abridged to head + tail,
-   oldest non-pinned messages first; old non-pinned messages collapsed to a
-   `[… N chars omitted …]` note; old tool calls reduced to one line each
-   (`t12 Read file_path=src/a.ts → ok 480ch`); old call-less messages left
-   out; runs of old call-only messages folded into one entry. If it still
-   does not fit, compaction throws. Tokens are estimated without a tokenizer (a
-   word per six letters, half a token per digit, ~one per other symbol),
-   calibrated to land a little above the counts Jev reports.
-4. For every non-pinned call Jev gets two `noul` questions: should the **call**
-   stay (knowing it was made, with its input, still matters), and should the
-   **result** stay verbatim (its contents are still needed and re-running the
-   tool would not do).
-5. Questions are split into as many requests as needed so state plus questions
-   stays under `maxRequestTokens` (30k by default, under Jev's 32k request
-   limit). The same full state is resent with every request; requests run
-   concurrently and their answers are merged.
-6. Decisions per call, against `keepThreshold`:
-   - `keepResult ≥ threshold` → keep call and result;
-   - else `keepCall ≥ threshold` → keep the call, truncate the result to its
-     first `truncateHeadChars` characters plus a one-line note;
-   - else → remove the call together with its result.
-7. The message list is rebuilt: a message that loses all its content is
-   removed, untouched messages are returned as the same objects, and no result
-   is ever left without its call.
+1. Every `tool_use` is paired with its `tool_result` by `tool_use_id`.
+2. The conversation is split into **episodes**: the tool calls between one
+   text and the next. An episode is a candidate when an assistant text closes
+   it (not a user prompt cutting it short), none of its messages is pinned (the
+   first message and the newest `preserveRecentMessages`), and its calls hold
+   at least 1000 characters of input and output.
+3. Each candidate gets its own request. The state holds that episode only: the
+   text it started with (`before`), one line per call (tool, input, ok or
+   error, size and the first 240 characters of the output), the text that
+   closes it (`after`), and the `goal` (the last three prompts by default).
+   One `noul` question asks whether `after` reports the result of the calls.
+   An episode too big for `maxStateTokens` / `maxRequestTokens` is shown with
+   60-character output heads, then with none, and left alone if it still does
+   not fit. Tokens are estimated without a tokenizer (a word per six letters,
+   half a token per digit, ~one per other symbol), calibrated to land a little
+   above the counts Jev reports.
+4. The keep probability is 1 minus that answer. Below `keepThreshold` the
+   episode is replaced: its calls and results disappear, and its first message
+   gets a note with one line per call
+   (`- Grep pattern=carp path=docs → ok, 312 chars`; a failed call shows the
+   first `truncateHeadChars` characters of its error instead of the size).
+5. The message list is rebuilt: every text stays as it was, a message that
+   loses all its content is removed, untouched messages are returned as the
+   same objects, and no result is ever left without its call.
 
-Jev failures, malformed answers, a missing key, or a history that cannot be
-fitted throw; the caller (or the Claude Code hook) decides what to fall back to.
+One episode per request is deliberate. With two dozen episodes in one state,
+decider-4b mixed them up and its scores no longer told stated findings from
+unstated ones; asked about one episode at a time, it separated them cleanly.
+
+Jev failures, malformed answers or a missing key throw; the caller (or the
+Claude Code hook) decides what to fall back to.
 
 ## Install and usage
 
@@ -90,40 +89,99 @@ can be passed in as is.
 To bring your own transport, implement `JevAsker` (one `ask(state, questions)`
 method) and call `compact(messages, asker, options)`; `buildJevRequest` and
 `parseJevResponse` give you the HTTP request body and response validation.
-The building blocks (`collectToolCalls`, `fitState`, `batchCalls`,
-`decideCall`, `applyDecisions`) are exported too.
+The building blocks (`collectToolCalls`, `collectEpisodes`, `episodeEntry`,
+`questionFor`, `sizeEpisode`, `applyEpisodes`, `replacementNote`) are exported
+too.
 
 `apiKey` defaults to `process.env.TYPESAFE_API_KEY`. Never commit the key or
 put it in a source file.
+
+### Other System One models (self-hosted decider)
+
+Any server that speaks TypeSafe's `POST /v1/systemone` wire format can stand in
+for Jev, e.g. [decider](https://huggingface.co/Mapika/decider-4b) served with
+`decider.serve`. Point `baseUrl` at it; no key is sent when `apiKey` is empty.
+
+```ts
+await compactMessages(transcript, {
+  baseUrl: 'http://192.168.107.103:5810/v1/systemone',
+  maxStateTokens: 24_000,
+  keepThreshold: 0.6,
+  maxConcurrentRequests: 1,
+});
+```
+
+decider-4b-v2.1 reads states of at least 31k tokens in full: sentences planted
+at both ends of a 70k-character state were found (0.97–0.98) and absent ones
+rejected (0.03–0.15). One episode is usually 1–3k tokens. On a real
+281k-character session with 24 candidate episodes, all requests together took
+5.7 s and saved 65 %. Requests to one server run one after another, so send
+them one at a time (`maxConcurrentRequests: 1`): the Claude Code host aborts
+each fetch after 30 s, and a queued request spends its wait inside that limit.
+`npm run demo` honours `SYSTEM_ONE_BASE_URL`.
 
 ## Options
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `apiKey` | `TYPESAFE_API_KEY` | TypeSafe API key (`compactMessages`/`JevClient`) |
-| `model` | `jev-latest` | Jev model name |
-| `baseUrl` | `https://api.typesafe.ai/v1/systemone` | System One endpoint |
+| `apiKey` | `TYPESAFE_API_KEY` | TypeSafe API key (`compactMessages`/`JevClient`); not needed with a custom `baseUrl` |
+| `model` | `jev-latest` | Jev model name (ignored by decider) |
+| `baseUrl` | `https://api.typesafe.ai/v1/systemone` | System One endpoint; any server with the same wire API works |
 | `fetch` | native `fetch` | Injectable fetch implementation for tests |
 | `goal` | last 3 user prompts | Ongoing task description included in the state |
-| `keepThreshold` | `0.5` | Minimum keep probability for a call or result to stay |
+| `keepThreshold` | `0.5` | Minimum keep probability (1 − P(the next text reports the outcome)) for an episode to stay call by call |
 | `preserveRecentMessages` | `6` | Newest messages never touched (the first is always kept) |
-| `maxStateTokens` | `25000` | Estimated token ceiling for the state |
-| `maxRequestTokens` | `30000` | Estimated ceiling for state plus one batch of questions |
-| `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
+| `maxStateTokens` | `25000` | Estimated token ceiling for the state of one request (one episode) |
+| `maxRequestTokens` | `30000` | Estimated ceiling for state plus question of one request |
+| `truncateHeadChars` | `300` | Characters of a failed call's output kept in the replacement note |
+| `maxConcurrentRequests` | `0` | Requests in flight at once; `1` for decider; `0` for no limit |
+| `condenser` | none | `EpisodeCondenser` (e.g. `LlmCondenser`) that turns kept episodes into a fact note |
+| `condenseMinChars` | `4000` | Smallest kept episode (tool input and output chars) handed to the condenser |
+| `maxConcurrentCondense` | `4` | Condenser calls in flight at once; `0` for no limit |
+| `condenseMinGrounded` | `0.3` | Smallest share of a note's identifiers found in the episode; below, or without `- ` fact lines, the note is dropped and the episode kept |
+| `archive` | none | `(episode, text) => Promise<path>`: stores a condensed episode's full outputs; the note points there |
 
-`result.stats` reports message and character counts before and after, the
-per-reason decision counts, the state size in estimated tokens, which fitting
-stage was needed, and the number of requests.
+`result.stats` reports message and character counts before and after, how
+many episodes were found, replaced, kept and skipped, the calls removed, the
+largest state in estimated tokens, and the number of requests.
+
+### Condensing kept episodes (optional)
+
+An episode Jev keeps holds outputs whose result the assistant never wrote
+down, so it stays verbatim and expensive. With a `condenser`, every kept
+episode of at least `condenseMinChars` goes to a fast LLM instead, which
+writes the facts from the outputs (paths, errors, ids, counts, verbatim) as a
+note; with `archive`, the full outputs are stored and the note names the file.
+A failed condenser call keeps the episode. Episodes Jev replaces never reach
+the condenser: their outcome is already in the text after them.
+
+```ts
+import { compact, JevClient, LlmCondenser } from 'fast-jev-compaction';
+
+await compact(transcript, new JevClient({ baseUrl: 'http://192.168.107.103:5810/v1/systemone' }), {
+  maxConcurrentRequests: 1,
+  condenser: new LlmCondenser({
+    url: 'http://192.168.107.103:11500/v1/chat/completions',
+    model: 'qwen3.8:27b',
+  }),
+});
+```
+
+`examples/replay.ts` replays local Claude Code sessions and compares drop-all,
+episodes, head+tail at the same size, and episodes plus condensing by
+reduction and by how many later-used facts from tool outputs survive.
 
 ## Limitations
 
-- Only tool calls and results are candidates; text messages are never removed
-  or shortened in the output (they are only abridged in the state Jev sees).
+- Only tool calls and results are removed; texts are never removed or
+  shortened in the output (they are only abridged in the state Jev sees).
+- An episode is kept or replaced as a whole. A run Jev keeps stays complete,
+  including outputs nobody needs any more.
+- A finding the assistant never wrote down ("analysis done, writing the page
+  now") keeps its episode. That is the point, but such runs stay expensive.
 - Token sizes are estimates from character counts, not a tokenizer.
-- Calibration is at the request level; a probability is not a proof that a
-  result is safe to delete. The assistant can always re-run the tool.
-- The full state is repeated with every request, so a history near the state
-  ceiling costs one request per handful of questions.
+- A probability is not a proof that an outcome is stated. The assistant can
+  always re-run a tool.
 
 ## Claude Code plugin
 
