@@ -7,7 +7,8 @@
  *
  *   npx tsx examples/replay.ts <out-dir> [sessions=15]
  *
- * Env: SYSTEM_ONE_BASE_URL (decider), CONDENSE_URL, CONDENSE_MODEL, PROJECTS_DIR.
+ * Env: SYSTEM_ONE_BASE_URL (decider), CONDENSE_URL, CONDENSE_MODEL, PROJECTS_DIR;
+ * CONDENSE_CLAUDE_MODEL (e.g. haiku) condenses through `claude -p` instead.
  *
  * A fact is a distinctive token (≥ 8 chars with a digit, `_`, `/` or `\`) from
  * a tool output before the boundary that the agent writes again (text or tool
@@ -16,16 +17,21 @@
  * and neither do tokens a later tool output brings back before the agent uses
  * them, nor tokens in the pinned newest messages.
  */
+import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   collectToolCalls,
   compact,
+  CONDENSE_SYSTEM,
+  condensePrompt,
   isPinned,
   JevClient,
   LlmCondenser,
   messageChars,
   type CompactOptions,
+  type CondenseInput,
+  type EpisodeCondenser,
   type JevAsker,
   type Message,
 } from '../src/index.js';
@@ -218,15 +224,63 @@ export function pickSessions(): { project: string; file: string }[] {
 
 type Row = Record<string, string | number>;
 
+/**
+ * A Claude model as condenser through `claude -p` on the user's own login,
+ * standing in for the hook's `$.model.complete`; `lastApiMs` is the API time
+ * of the last call (the CLI's start-up excluded).
+ */
+function cliCondenser(model: string): EpisodeCondenser & { lastApiMs: WeakMap<CondenseInput, number> } {
+  const lastApiMs = new WeakMap<CondenseInput, number>();
+  return {
+    lastApiMs,
+    condense: (input) =>
+      new Promise((resolve, reject) => {
+        const child = spawn(
+          'claude.exe',
+          [
+            '-p',
+            '--model', model,
+            '--system-prompt', CONDENSE_SYSTEM,
+            '--tools', '',
+            '--strict-mcp-config',
+            '--no-session-persistence',
+            '--disable-slash-commands',
+            '--settings', JSON.stringify({ disableAllHooks: true, language: 'English', alwaysThinkingEnabled: false }),
+            '--output-format', 'json',
+          ],
+          { stdio: ['pipe', 'pipe', 'pipe'] },
+        );
+        let out = '';
+        let err = '';
+        child.stdout.on('data', (chunk) => (out += chunk));
+        child.stderr.on('data', (chunk) => (err += chunk));
+        child.on('error', reject);
+        child.on('close', (code) => {
+          try {
+            const reply = JSON.parse(out) as { result?: string; is_error?: boolean; duration_api_ms?: number };
+            if (code !== 0 || reply.is_error || typeof reply.result !== 'string') throw new Error(reply.result ?? err);
+            lastApiMs.set(input, reply.duration_api_ms ?? 0);
+            resolve(reply.result.trim());
+          } catch (error) {
+            reject(new Error(`claude -p failed (${code}): ${String(error).slice(0, 300)}`));
+          }
+        });
+        child.stdin.end(condensePrompt(input));
+      }),
+  };
+}
+
 async function main() {
   mkdirSync(outDir, { recursive: true });
   const decider = cached(new JevClient({ baseUrl: deciderUrl }));
-  const condenser = new LlmCondenser({ url: condenseUrl, model: condenseModel });
+  const claudeModel = process.env.CONDENSE_CLAUDE_MODEL;
+  const cli = claudeModel ? cliCondenser(claudeModel) : undefined;
+  const condenser: EpisodeCondenser = cli ?? new LlmCondenser({ url: condenseUrl, model: condenseModel });
   // A rerun into the same folder resumes: finished points are skipped.
   const resultsFile = join(outDir, 'results.json');
   const previous = existsSync(resultsFile) ? JSON.parse(readFileSync(resultsFile, 'utf8')) : {};
   const rows: Row[] = previous.rows ?? [];
-  const samples: { session: string; facts: string; outputChars: number; grounded: number }[] =
+  const samples: { session: string; facts: string; outputChars: number; grounded: number; ms: number }[] =
     previous.samples ?? [];
   const done = new Set(rows.map((r) => r.session));
   for (const { project, file } of pickSessions()) for (const { at, prefix, future } of cutPoints(parseSession(file))) {
@@ -273,7 +327,9 @@ async function main() {
       ...BASE,
       condenser: {
         async condense(input) {
+          const started = Date.now();
           const note = await condenser.condense(input);
+          const ms = cli?.lastApiMs.get(input) ?? Date.now() - started;
           const source = tokens(input.calls.map((c) => `${JSON.stringify(c.input)}\n${c.output}`).join('\n') + input.after + (input.before ?? ''));
           const own = [...tokens(note)];
           samples.push({
@@ -281,6 +337,7 @@ async function main() {
             facts: note,
             outputChars: input.calls.reduce((s, c) => s + c.output.length, 0),
             grounded: own.length === 0 ? 1 : own.filter((t) => source.has(t)).length / own.length,
+            ms,
           });
           return note;
         },

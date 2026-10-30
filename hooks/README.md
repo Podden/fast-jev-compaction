@@ -58,6 +58,7 @@ The plugin declares these `userConfig` values in
 | `model` | `jev-latest` |
 | `condenseUrl` | empty (off) |
 | `condenseModel` | `qwen3.8:27b` |
+| `condenseClaudeModel` | empty (`condenseUrl` decides) |
 | `condenseMinChars` | `4000` |
 | `maxConcurrentCondense` | `4` |
 
@@ -79,8 +80,13 @@ do. The `session.compact` hook sends one request per episode, up to
 key is unavailable, or the estimated reduction is below `minReductionRatio`,
 the hook logs a fallback and delegates to Claude Code's built-in compaction.
 The outcome is shown as a toast and logged with the reduction, replaced and
-kept episodes, largest state and request count; a `decisions:` line with each
-episode's keep probability is logged for diagnosis. The
+kept episodes, largest state, request count and the time of each stage; a
+`decisions:` line with each episode's keep probability (and its condenser call:
+ok or failed, with its time) and a `condense errors:` line naming each distinct
+failure are logged for diagnosis. Every line starts with the trigger
+(`[auto]`, `[manual]`, `[plugin]`, `[precompute]`), a `start:` line marks when
+a run began, and after a fallback one more line says what the built-in summary
+did and how long it took. The
 `turn.complete` hook requests compaction when `context.percent` reaches
 `compactAtPercent` after an answered main-thread turn; the request runs once
 the dispatch has resolved (inside it the turn still counts as in flight), and
@@ -90,6 +96,11 @@ With `condenseUrl` set, kept episodes of at least `condenseMinChars` are
 replaced by a fact note from that model, and their full outputs are written to
 `.claude/fast-jev/<timestamp>/<episode>.txt` in the working directory (with a
 `.gitignore` of `*`); the note names the file.
+
+With `condenseClaudeModel` set (e.g. `haiku`), that Claude model writes the
+note through `$.model.complete`, the session's own client and credentials,
+instead of `condenseUrl`. Requests through `$.http.fetch` are aborted after
+30 s by the host, which a self-hosted model writing a full note can exceed.
 
 Kept messages are handed back without the engine's `handle`, so they are
 written as fresh records after the compact boundary and `--resume` reloads the

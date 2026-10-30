@@ -375,6 +375,7 @@ describe('condenser stage', () => {
       condenser: { condense: async () => Promise.reject(new Error('down')) },
     });
     expect(output.decisions.map((d) => d.action)).toEqual(['keep', 'keep']);
+    expect(output.decisions.map((d) => d.condenseError)).toEqual(['down', 'down']);
     expect(output.messages).toHaveLength(transcript().length);
     expect(output.stats).toMatchObject({ condensed: 0, condenseFailed: 2 });
   });
@@ -393,6 +394,10 @@ describe('condenser guard', () => {
       condenser: { condense: async () => notes.shift()! },
     });
     expect(output.decisions.map((d) => d.action)).toEqual(['keep', 'keep']);
+    expect(output.decisions.map((d) => d.condenseError)).toEqual([
+      'note rejected: no "- " fact lines',
+      expect.stringMatching(/^note rejected: grounded 0\.\d\d < 0\.3$/),
+    ]);
     expect(output.stats).toMatchObject({ condensed: 0, condenseFailed: 2 });
   });
 

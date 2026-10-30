@@ -82,6 +82,12 @@
       "description": "Model name for the condenser endpoint.",
       "default": "qwen3.8:27b"
     },
+    "condenseClaudeModel": {
+      "type": "string",
+      "title": "Claude condenser model",
+      "description": "Claude model (e.g. haiku) that writes the fact note through the session's own client and credentials, instead of condenseUrl. No API key and no 30 s per-request limit; billed to the Claude account. Empty: condenseUrl decides.",
+      "default": ""
+    },
     "condenseMinChars": {
       "type": "number",
       "title": "Minimum characters to condense",

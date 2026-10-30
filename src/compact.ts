@@ -247,11 +247,13 @@ export async function compact(
     const item = sizeEpisode(messages, episode, baseTokens, resolved);
     if (item) sized.push(item);
   }
+  const deciderStarted = Date.now();
   const answered = await mapLimited(sized, resolved.maxConcurrentRequests, async (item) => {
     const state: EpisodeState = { context: STATE_CONTEXT, goal, episodes: [item.entry] };
     const { answers } = await asker.ask(state, questionFor(item.episode));
     return 1 - noulAnswer(answers, `outcome_${item.episode.id}`);
   });
+  const deciderMs = Date.now() - deciderStarted;
 
   const decisions: EpisodeDecision[] = sized.map(({ episode }, index) => {
     const keep = answered[index]!;
@@ -272,20 +274,28 @@ export async function compact(
     await mapLimited(chosen, resolved.maxConcurrentCondense, async (decision) => {
       const episode = episodes.find((e) => e.id === decision.id)!;
       const input = condenseInput(messages, episode, goal);
+      const callStarted = Date.now();
       let facts: string;
       try {
         facts = await condenser.condense(input);
-      } catch {
+      } catch (error) {
+        decision.condenseMs = Date.now() - callStarted;
+        decision.condenseError = error instanceof Error ? error.message : String(error);
         condenseFailed += 1;
         return;
       }
+      decision.condenseMs = Date.now() - callStarted;
       // A note in the wrong shape or with identifiers the outputs never held is
       // made up (seen: a whole invented shell session); keep the episode then.
       facts = facts
         .split('\n')
         .filter((line) => line.startsWith('- '))
         .join('\n');
-      if (!facts || groundedShare(facts, condenseSource(input)) < resolved.condenseMinGrounded) {
+      const grounded = facts ? groundedShare(facts, condenseSource(input)) : 0;
+      if (!facts || grounded < resolved.condenseMinGrounded) {
+        decision.condenseError = facts
+          ? `note rejected: grounded ${grounded.toFixed(2)} < ${resolved.condenseMinGrounded}`
+          : 'note rejected: no "- " fact lines';
         condenseFailed += 1;
         return;
       }
@@ -315,6 +325,7 @@ export async function compact(
       condensed: notes.size,
       condenseFailed,
       condenseMs,
+      deciderMs,
       skipped: episodes.length - decisions.length,
       callsRemoved: replaced.reduce((sum, episode) => sum + episode.calls.length, 0),
       stateTokens: Math.max(0, ...sized.map((item) => baseTokens + item.entryTokens)),

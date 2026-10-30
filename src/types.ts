@@ -91,6 +91,10 @@ export interface EpisodeDecision {
   keep: number;
   /** `condense`: kept by Jev, then replaced by the condenser's fact note. */
   action: 'keep' | 'replace' | 'condense';
+  /** Wall time of the condenser call; set when the episode went to the condenser. */
+  condenseMs?: number;
+  /** Why the condenser's note was not used: the call's error, or the guard's verdict. */
+  condenseError?: string;
 }
 
 /** One call of an episode handed to a condenser, with its full output. */
@@ -184,6 +188,8 @@ export interface CompactResult {
     condenseFailed: number;
     /** Wall time of the condenser stage. */
     condenseMs: number;
+    /** Wall time of the Jev requests. */
+    deciderMs: number;
     /** Episodes left alone without asking: too small, or too big for one request. */
     skipped: number;
     callsRemoved: number;

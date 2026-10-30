@@ -9,7 +9,12 @@ import type {
 } from 'claude-code';
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
-import { buildCondenseRequest, parseCondenseResponse } from '../src/condense.js';
+import {
+  buildCondenseRequest,
+  CONDENSE_SYSTEM,
+  condensePrompt,
+  parseCondenseResponse,
+} from '../src/condense.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
 import type {
   CompactOptions,
@@ -53,7 +58,17 @@ export type HookConfig = CompactOptions & {
   /** OpenAI-compatible chat completions URL; set, kept episodes get a fact note. */
   condenseUrl?: string;
   condenseModel: string;
+  /** A Claude model (`haiku` or a full id) that writes the fact note through the session's own client; wins over `condenseUrl`. */
+  condenseClaudeModel?: string;
 };
+
+/** The shape of `$.model.complete`. */
+export type ModelComplete = (request: {
+  model: string;
+  prompt: string;
+  system?: string;
+  maxTokens?: number;
+}) => Promise<string>;
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
   const value = options[key];
@@ -94,6 +109,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   };
   const condenseUrl = optionString(options, 'condenseUrl');
   if (condenseUrl) config.condenseUrl = condenseUrl;
+  const condenseClaudeModel = optionString(options, 'condenseClaudeModel');
+  if (condenseClaudeModel) config.condenseClaudeModel = condenseClaudeModel;
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
   const baseUrl = optionString(options, 'baseUrl');
@@ -189,6 +206,22 @@ export function llmCondenser(fetchFn: HookFetch, url: string, model: string): Ep
 }
 
 /**
+ * An `EpisodeCondenser` over `$.model.complete`: the session's own client and
+ * credentials, so no key and no `$.http.fetch` time limit.
+ */
+export function claudeCondenser(complete: ModelComplete, model: string): EpisodeCondenser {
+  return {
+    async condense(input) {
+      const note = (
+        await complete({ model, system: CONDENSE_SYSTEM, prompt: condensePrompt(input), maxTokens: 1000 })
+      ).trim();
+      if (!note) throw new Error(`condense reply from ${model} has no text`);
+      return note;
+    },
+  };
+}
+
+/**
  * Drops the engine's `handle` so each kept message is written as a fresh
  * record after the compact boundary. With handles, kept records keep their
  * parentUuid and message.id from before the boundary, and `--resume` walks
@@ -211,17 +244,19 @@ export async function compactSession(
   config: HookConfig,
   fetchFn: HookFetch,
   archive?: CompactOptions['archive'],
+  complete?: ModelComplete,
 ): Promise<SessionCompaction> {
   if (!config.apiKey && !config.baseUrl) throw new Error('TYPESAFE_API_KEY is not configured');
+  const condenser =
+    config.condenseClaudeModel && complete
+      ? claudeCondenser(complete, config.condenseClaudeModel)
+      : config.condenseUrl
+        ? llmCondenser(fetchFn, config.condenseUrl, config.condenseModel)
+        : undefined;
   const result = await compact(
     messages,
     jevAsker(fetchFn, config.apiKey, config.model, config.baseUrl),
-    {
-      ...config,
-      ...(config.condenseUrl
-        ? { condenser: llmCondenser(fetchFn, config.condenseUrl, config.condenseModel), archive }
-        : {}),
-    },
+    { ...config, ...(condenser ? { condenser, archive } : {}) },
   );
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
@@ -230,25 +265,49 @@ function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
 }
 
+function seconds(ms: number): string {
+  return `${(ms / 1000).toFixed(1)} s`;
+}
+
 export function summarize(result: CompactResult): string {
   const { stats } = result;
   const parts = [
     `${stats.replaced} of ${stats.replaced + stats.kept} episodes replaced (${stats.callsRemoved} calls)`,
-    stats.condensed > 0 ? `${stats.condensed} condensed in ${(stats.condenseMs / 1000).toFixed(1)} s` : '',
-    stats.condenseFailed > 0 ? `${stats.condenseFailed} condense failed` : '',
+    stats.condensed > 0 || stats.condenseFailed > 0
+      ? `${stats.condensed} condensed${
+          stats.condenseFailed > 0 ? `, ${stats.condenseFailed} condense failed` : ''
+        } in ${seconds(stats.condenseMs)}`
+      : '',
     stats.skipped > 0 ? `${stats.skipped} too small` : '',
   ].filter(Boolean);
   return `${percent(reductionRatio(result))} reduction; ${parts.join(', ')}; state up to ~${
     stats.stateTokens
-  } tokens in ${stats.requests} request(s)`;
+  } tokens in ${stats.requests} request(s), ${seconds(stats.deciderMs)}; total ${seconds(stats.ms)}`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
 
 export function decisionLog(result: CompactResult): string {
   return result.decisions
-    .map((d) => `${d.id}:${d.calls}calls/${d.chars}ch:${d.action}/keep=${d.keep.toFixed(2)}`)
+    .map((d) => {
+      const condense =
+        d.condenseMs === undefined
+          ? ''
+          : `/condense=${d.condenseError === undefined ? 'ok' : 'failed'}:${seconds(d.condenseMs).replace(' ', '')}`;
+      return `${d.id}:${d.calls}calls/${d.chars}ch:${d.action}/keep=${d.keep.toFixed(2)}${condense}`;
+    })
     .join(' ');
+}
+
+/** One line naming each distinct condenser failure and how often it happened; none without failures. */
+export function condenseErrorLines(result: CompactResult): string[] {
+  const counts = new Map<string, number>();
+  for (const { condenseError } of result.decisions) {
+    if (condenseError !== undefined) counts.set(condenseError, (counts.get(condenseError) ?? 0) + 1);
+  }
+  if (counts.size === 0) return [];
+  const listed = [...counts].map(([error, count]) => `${count}× ${error.slice(0, 300)}`).join(' | ');
+  return [`condense errors: ${listed}`.slice(0, UI_LOG_MAX_CHARS)];
 }
 
 export function decisionLogLines(
@@ -313,10 +372,33 @@ export const register: Register = (on: On, options: PluginOptions) => {
   on('session.compact', async ($, event, next) => {
     // Subagent and fork transcripts are short-lived; leave them to the engine.
     if (event.agentId) return next(event);
+    const tag = `[${event.trigger}]`;
     // A speculative compaction would cost a full Jev run per turn (#107).
     if (event.trigger === 'precompute') {
+      $.ui.log(`${tag} skipped: fast-jev-compaction does not precompute`);
       return { skip: 'fast-jev-compaction does not precompute' };
     }
+    $.ui.log(`${tag} start: ${event.messages.length} messages`);
+    const fallBack = async (reason: string) => {
+      notify($, `${tag} fallback to built-in summary (${reason})`);
+      const started = Date.now();
+      try {
+        const out = await next(event);
+        $.ui.log(
+          `${tag} built-in summary ${
+            out.skip !== undefined ? `skipped (${out.skip})` : `done: ${out.messages?.length ?? 0} messages`
+          } in ${seconds(Date.now() - started)}`,
+        );
+        return out;
+      } catch (error) {
+        $.ui.log(
+          `${tag} built-in summary failed in ${seconds(Date.now() - started)} (${
+            error instanceof Error ? error.message : String(error)
+          })`,
+        );
+        throw error;
+      }
+    };
     try {
       const config = { ...configured, apiKey: await getApiKey($, configured) };
       const folder = `.claude/fast-jev/${new Date().toISOString().replace(/[:.]/g, '-')}`;
@@ -334,26 +416,20 @@ export const register: Register = (on: On, options: PluginOptions) => {
           await $.fs.write(path, text);
           return path;
         },
+        (request) => $.model.complete(request),
       );
       for (const line of decisionLogLines(result)) $.ui.log(line);
+      for (const line of condenseErrorLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
-        notify(
-          $,
-          `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`,
-        );
-        return next(event);
+        return fallBack(`below ${percent(config.minReductionRatio)} minimum: ${summarize(result)}`);
       }
       notify(
         $,
-        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
+        `${tag} kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
       );
       return { messages: withoutHandles(messages) };
     } catch (error) {
-      notify(
-        $,
-        `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
-      );
-      return next(event);
+      return fallBack(error instanceof Error ? error.message : String(error));
     }
   });
 
@@ -369,11 +445,17 @@ export const register: Register = (on: On, options: PluginOptions) => {
         compacting = false;
         return next(event);
       }
+      $.ui.log(
+        `auto-compact requested at ${context.percent}% (${context.tokens ?? '?'} tokens, compactAtPercent ${configured.compactAtPercent})`,
+      );
       // Inside this dispatch the turn still counts as in flight and compact()
       // is rejected; run it once the dispatch has resolved (#149).
       $.clock.after(0, () => {
         $.session
           .compact()
+          .then((out) => {
+            if (out.skip !== undefined) $.ui.log(`auto-compact skipped (${out.skip})`);
+          })
           .catch(skipped)
           .finally(() => {
             compacting = false;

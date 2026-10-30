@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   compactSession,
+  condenseErrorLines,
   decisionLog,
   decisionLogLines,
   register,
@@ -112,7 +113,7 @@ describe('compactSession', () => {
     expect(output.decisions.map((d) => d.action)).toEqual(['replace', 'keep']);
     expect(messages.map((m) => m.handle)).toEqual(['h-0', undefined, 'h-3', 'h-tool-2', 'r-tool-2', 'h-6', 'h-7']);
     expect(summarize(output)).toMatch(
-      /^\d+% reduction; 1 of 2 episodes replaced \(1 calls\); state up to ~\d+ tokens in 2 request\(s\)$/,
+      /^\d+% reduction; 1 of 2 episodes replaced \(1 calls\); state up to ~\d+ tokens in 2 request\(s\), \d+\.\d s; total \d+\.\d s$/,
     );
     const [e1, e2] = output.decisions;
     expect(decisionLog(output)).toBe(
@@ -174,6 +175,56 @@ describe('compactSession', () => {
     expect(prompts[1]).toContain('FAIL b.test.ts');
     expect(messages.some((m) => m.text.includes('Full outputs: .claude/fast-jev/x/e2.txt'))).toBe(true);
     expect(summarize(output)).toContain('2 condensed in');
+    expect(decisionLog(output)).toMatch(/e1:.*\/condense=ok:\d+\.\ds e2:.*\/condense=ok:\d+\.\ds$/);
+    expect(condenseErrorLines(output)).toEqual([]);
+  });
+
+  it('condenses through $.model.complete when a Claude model is set, ahead of condenseUrl', async () => {
+    const urls: string[] = [];
+    const decider = jevFetch(() => 0);
+    const fetchFn = async (url: string, init?: { body?: string }) => {
+      urls.push(url);
+      return decider(url, init);
+    };
+    const requests: { model: string; system?: string; prompt: string }[] = [];
+    const complete = async (request: { model: string; system?: string; prompt: string }) => {
+      requests.push(request);
+      return '- FAIL b.test.ts: expected 2 to be 3\n';
+    };
+    const config = {
+      ...resolveHookConfig({
+        preserveRecentMessages: 1,
+        condenseUrl: 'http://llm.local/v1/chat/completions',
+        condenseClaudeModel: 'haiku',
+        condenseMinChars: 0,
+      }),
+      apiKey: 'k',
+    };
+    const { result: output } = await compactSession(transcript(), config, fetchFn, undefined, complete);
+    expect(output.stats.condensed).toBe(2);
+    expect(urls.some((u) => u.includes('chat/completions'))).toBe(false);
+    expect(requests.map((r) => r.model)).toEqual(['haiku', 'haiku']);
+    expect(requests[0]!.system).toContain('You compact a coding assistant conversation');
+    expect(requests[1]!.prompt).toContain('FAIL b.test.ts');
+  });
+
+  it('names each condenser failure with its count', async () => {
+    const decider = jevFetch(() => 0);
+    const fetchFn = async (url: string, init?: { body?: string }) => {
+      if (!url.includes('chat/completions')) return decider(url, init);
+      throw new Error('$.http.fetch(http://llm.local) aborted: no complete answer within 30000ms');
+    };
+    const config = {
+      ...resolveHookConfig({ preserveRecentMessages: 1, condenseUrl: 'http://llm.local/v1/chat/completions', condenseMinChars: 0 }),
+      apiKey: 'k',
+    };
+    const { result: output } = await compactSession(transcript(), config, fetchFn);
+    expect(output.stats).toMatchObject({ condensed: 0, condenseFailed: 2 });
+    expect(summarize(output)).toContain('0 condensed, 2 condense failed in');
+    expect(decisionLog(output)).toContain('/condense=failed:');
+    expect(condenseErrorLines(output)).toEqual([
+      'condense errors: 2× $.http.fetch(http://llm.local) aborted: no complete answer within 30000ms',
+    ]);
   });
 
   it('throws on a missing key and on failed requests so the hook falls back', async () => {
@@ -237,12 +288,23 @@ describe('register', () => {
   });
 
   it('leaves subagent compactions to the engine and skips precompute (#107)', async () => {
-    const { $, next, handlers } = engine();
+    const { $, next, handlers, effects } = engine();
     const sub = { trigger: 'auto', agentId: 'a1', messages: transcript() };
     expect(await handlers['session.compact']!($, sub, next)).toEqual({ passed: sub });
     expect(await handlers['session.compact']!($, { trigger: 'precompute', messages: transcript() }, next)).toEqual({
       skip: expect.any(String),
     });
+    expect(effects.logs).toEqual(['[precompute] skipped: fast-jev-compaction does not precompute']);
+  });
+
+  it('logs the trigger, the start and what the built-in summary did after a fallback', async () => {
+    const { $, handlers, effects } = engine();
+    $.http.fetch = async () => ({ status: 500, ok: false, text: 'boom' });
+    const next = async () => ({ messages: [{ role: 'user', text: 'summary', toolUses: [] }] });
+    await handlers['session.compact']!($, { trigger: 'auto', messages: transcript() }, next);
+    expect(effects.logs[0]).toBe(`[auto] start: ${transcript().length} messages`);
+    expect(effects.logs[1]).toMatch(/^\[auto\] fallback to built-in summary \(.*500/);
+    expect(effects.logs[2]).toMatch(/^\[auto\] built-in summary done: 1 messages in \d+\.\d s$/);
   });
 
   it('defers auto-compaction past the turn and guards against a second request (#149)', async () => {
